@@ -1,0 +1,1242 @@
+#define BLYNK_TEMPLATE_ID   "Your_Template_ID"
+#define BLYNK_TEMPLATE_NAME "Schedule Automatic Feeding System Using ESP32"
+#define BLYNK_AUTH_TOKEN    "Your_Token"
+
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <ArduinoOTA.h>
+#include <time.h>
+#include <BlynkSimpleEsp32.h>
+
+// =====================================================
+// 1. SETTINGS
+// =====================================================
+
+#define PUMP1_PIN 26
+#define PUMP2_PIN 27
+
+// Relay module: Active LOW
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
+
+// Wi-Fi setup portal
+const char* AP_SSID = "ESP32-Feeding-Setup";
+const char* AP_PASSWORD = "esp32setup";
+
+// OTA (ไม่ตั้งรหัสผ่าน)
+const char* OTA_HOSTNAME = "ESP32-Feeding-System";
+
+// Thailand UTC+7
+const long GMT_OFFSET_SEC = 7L * 60L * 60L;
+const int DAYLIGHT_OFFSET_SEC = 0;
+
+const uint8_t SCHEDULE_COUNT = 4;
+
+// เวลาเปิดปั๊มเก็บเป็นหน่วย 0.1 วินาที
+const uint16_t MIN_PUMP_TENTHS = 1;     // 0.1 วินาที
+const uint16_t MAX_PUMP_TENTHS = 3000;  // 300.0 วินาที
+
+const uint16_t MIN_REPETITIONS = 1;
+const uint16_t MAX_REPETITIONS = 20;
+
+const uint16_t MAX_GAP_SECONDS = 3600;
+
+// ถึงเวลาแล้ว ยังเริ่มรันได้อีกกี่วินาที (กันพลาดจากบันทึกช้า/รีบูต)
+const uint32_t RUN_WINDOW_SEC = 120;
+
+// WiFi หลุดเกินกี่ ms ถึงเปิด AP
+const unsigned long WIFI_PORTAL_DELAY_MS = 20000;
+
+// =====================================================
+// 2. GLOBALS
+// =====================================================
+
+Preferences preferences;
+
+WebServer portalServer(80);
+DNSServer dnsServer;
+
+BlynkTimer blynkTimer;
+
+bool portalActive = false;
+bool wifiWasConnected = false;
+
+bool otaStarted = false;
+bool otaInProgress = false;
+
+String wifiSSID;
+String wifiPassword;
+
+unsigned long lastWiFiRetry = 0;
+unsigned long lastBlynkRetry = 0;
+unsigned long lastNtpRetry = 0;
+unsigned long wifiLostSince = 0;
+
+unsigned long cloudSyncStarted = 0;
+bool cloudConfigReceived = false;
+
+String systemStatus = "Starting";
+
+// =====================================================
+// 3. SCHEDULE DATA
+// =====================================================
+
+struct ScheduleConfig {
+  uint8_t hour = 0;
+  uint8_t minute = 0;
+
+  // Monday = bit 0 ... Sunday = bit 6
+  uint8_t dayMask = 127;
+
+  bool enabled = false;
+  bool reverseOrder = false;
+
+  uint16_t tenths26 = 100;      // 10.0 วินาที
+  uint16_t repetitions26 = 2;
+
+  uint16_t tenths27 = 100;      // 10.0 วินาที
+  uint16_t repetitions27 = 2;
+
+  uint16_t gapSeconds = 30;
+};
+
+ScheduleConfig schedules[SCHEDULE_COUNT];
+
+uint32_t lastRunDate[SCHEDULE_COUNT] = { 0, 0, 0, 0 };
+
+uint8_t pendingMask = 0;
+
+// =====================================================
+// 4. SEQUENCER STATE
+// =====================================================
+
+enum MachineState {
+  MACHINE_IDLE,
+  MACHINE_PUMP_ON,
+  MACHINE_GAP
+};
+
+MachineState machineState = MACHINE_IDLE;
+
+uint8_t activeSchedule = 0;
+uint8_t firstPump = 0;
+uint8_t currentPump = 0;
+
+uint16_t repetitionCount = 0;
+
+uint32_t machineDeadline = 0;
+
+// =====================================================
+// 5. STATUS
+// =====================================================
+
+bool isTimeReady() {
+  return time(nullptr) > 1700000000;
+}
+
+String timeInfoText() {
+  if (!isTimeReady()) {
+    return "NTP: not synced";
+  }
+
+  time_t now = time(nullptr);
+
+  tm t;
+  localtime_r(&now, &t);
+
+  char buf[32];
+  strftime(buf, sizeof(buf), "%d/%m %H:%M:%S", &t);
+
+  return String(buf);
+}
+
+void publishStatus() {
+  Serial.print("[TIME] ");
+  Serial.println(timeInfoText());
+
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V41, systemStatus + " | " + timeInfoText());
+  }
+}
+
+void setStatus(const String& message) {
+  systemStatus = message;
+
+  Serial.print("[STATUS] ");
+  Serial.println(systemStatus);
+
+  publishStatus();
+}
+
+// =====================================================
+// 6. PUMP CONTROL
+// =====================================================
+
+void allPumpsOff() {
+  digitalWrite(PUMP1_PIN, RELAY_OFF);
+  digitalWrite(PUMP2_PIN, RELAY_OFF);
+}
+
+void setPump(uint8_t pump, bool turnOn) {
+  allPumpsOff();
+
+  if (!turnOn) {
+    return;
+  }
+
+  digitalWrite(
+    pump == 0 ? PUMP1_PIN : PUMP2_PIN,
+    RELAY_ON
+  );
+}
+
+// =====================================================
+// 7. CONFIG TEXT FORMAT
+//    "HH:MM,days,enabled,order,sec26,rep26,sec27,rep27,gap|..." (4 แถว)
+// =====================================================
+
+// แยกข้อความด้วยตัวคั่น คืนจำนวนส่วนที่ได้ (ถ้าเกิน maxParts คืน maxParts+1)
+int splitString(
+  const String& text,
+  char separator,
+  String* parts,
+  int maxParts
+) {
+  int count = 0;
+  int start = 0;
+
+  while (count < maxParts) {
+    int idx = text.indexOf(separator, start);
+
+    if (idx < 0) {
+      parts[count++] = text.substring(start);
+      return count;
+    }
+
+    parts[count++] = text.substring(start, idx);
+    start = idx + 1;
+  }
+
+  return maxParts + 1;
+}
+
+bool parseUInt(String s, uint32_t& out) {
+  s.trim();
+
+  if (s.length() == 0 || s.length() > 5) {
+    return false;
+  }
+
+  for (size_t i = 0; i < s.length(); i++) {
+    if (!isDigit(s[i])) {
+      return false;
+    }
+  }
+
+  out = (uint32_t)s.toInt();
+
+  return true;
+}
+
+// "10", "2.5", "0.1" -> หน่วย 0.1 วินาที
+bool parseTenths(String s, uint32_t& out) {
+  s.trim();
+
+  if (s.length() == 0) {
+    return false;
+  }
+
+  int dot = s.indexOf('.');
+
+  String whole = (dot < 0) ? s : s.substring(0, dot);
+  String frac  = (dot < 0) ? "" : s.substring(dot + 1);
+
+  if (
+    whole.length() == 0 ||
+    whole.length() > 4 ||
+    frac.length() > 1
+  ) {
+    return false;
+  }
+
+  uint32_t w = 0;
+  uint32_t f = 0;
+
+  if (!parseUInt(whole, w)) {
+    return false;
+  }
+
+  if (frac.length() == 1 && !parseUInt(frac, f)) {
+    return false;
+  }
+
+  out = w * 10 + f;
+
+  return true;
+}
+
+void formatTenths(char* buf, size_t size, uint16_t tenths) {
+  if (tenths % 10 == 0) {
+    snprintf(buf, size, "%u", (unsigned)(tenths / 10));
+  } else {
+    snprintf(
+      buf,
+      size,
+      "%u.%u",
+      (unsigned)(tenths / 10),
+      (unsigned)(tenths % 10)
+    );
+  }
+}
+
+String serializeConfig() {
+  String output;
+  output.reserve(260);
+
+  for (uint8_t i = 0; i < SCHEDULE_COUNT; i++) {
+    const ScheduleConfig& s = schedules[i];
+
+    char t26[12];
+    char t27[12];
+    char row[96];
+
+    formatTenths(t26, sizeof(t26), s.tenths26);
+    formatTenths(t27, sizeof(t27), s.tenths27);
+
+    snprintf(
+      row,
+      sizeof(row),
+      "%02u:%02u,%u,%u,%u,%s,%u,%s,%u,%u",
+      (unsigned)s.hour,
+      (unsigned)s.minute,
+      (unsigned)s.dayMask,
+      (unsigned)(s.enabled ? 1 : 0),
+      (unsigned)(s.reverseOrder ? 1 : 0),
+      t26,
+      (unsigned)s.repetitions26,
+      t27,
+      (unsigned)s.repetitions27,
+      (unsigned)s.gapSeconds
+    );
+
+    output += row;
+
+    if (i < SCHEDULE_COUNT - 1) {
+      output += "|";
+    }
+  }
+
+  return output;
+}
+
+// ตรวจและแปลงข้อความ -> out (ไม่แตะ schedules จนกว่าจะผ่านทั้งหมด)
+bool parseConfig(String payload, ScheduleConfig* out) {
+  payload.trim();
+
+  String rows[SCHEDULE_COUNT];
+
+  if (splitString(payload, '|', rows, SCHEDULE_COUNT) != SCHEDULE_COUNT) {
+    return false;
+  }
+
+  for (uint8_t i = 0; i < SCHEDULE_COUNT; i++) {
+    String f[9];
+
+    if (splitString(rows[i], ',', f, 9) != 9) {
+      return false;
+    }
+
+    for (uint8_t j = 0; j < 9; j++) {
+      f[j].trim();
+    }
+
+    if (f[0].length() != 5 || f[0][2] != ':') {
+      return false;
+    }
+
+    uint32_t hh, mm, days, en, order, t26, r26, t27, r27, gap;
+
+    if (
+      !parseUInt(f[0].substring(0, 2), hh) ||
+      !parseUInt(f[0].substring(3, 5), mm) ||
+      !parseUInt(f[1], days) ||
+      !parseUInt(f[2], en) ||
+      !parseUInt(f[3], order) ||
+      !parseTenths(f[4], t26) ||
+      !parseUInt(f[5], r26) ||
+      !parseTenths(f[6], t27) ||
+      !parseUInt(f[7], r27) ||
+      !parseUInt(f[8], gap)
+    ) {
+      return false;
+    }
+
+    if (
+      hh > 23 ||
+      mm > 59 ||
+      days > 127 ||
+      en > 1 ||
+      order > 1 ||
+      t26 < MIN_PUMP_TENTHS || t26 > MAX_PUMP_TENTHS ||
+      r26 < MIN_REPETITIONS || r26 > MAX_REPETITIONS ||
+      t27 < MIN_PUMP_TENTHS || t27 > MAX_PUMP_TENTHS ||
+      r27 < MIN_REPETITIONS || r27 > MAX_REPETITIONS ||
+      gap > MAX_GAP_SECONDS
+    ) {
+      return false;
+    }
+
+    out[i].hour = hh;
+    out[i].minute = mm;
+    out[i].dayMask = days;
+    out[i].enabled = (en == 1);
+    out[i].reverseOrder = (order == 1);
+    out[i].tenths26 = t26;
+    out[i].repetitions26 = r26;
+    out[i].tenths27 = t27;
+    out[i].repetitions27 = r27;
+    out[i].gapSeconds = gap;
+  }
+
+  return true;
+}
+
+// สรุปสั้นๆ สำหรับแสดงที่ป้ายสถานะ: + = เปิดใช้งาน, - = ปิด
+String configSummary() {
+  String s;
+
+  for (uint8_t i = 0; i < SCHEDULE_COUNT; i++) {
+    char buf[24];
+
+    snprintf(
+      buf,
+      sizeof(buf),
+      " S%u %02u:%02u%s",
+      (unsigned)(i + 1),
+      (unsigned)schedules[i].hour,
+      (unsigned)schedules[i].minute,
+      schedules[i].enabled ? "+" : "-"
+    );
+
+    s += buf;
+  }
+
+  return s;
+}
+
+// =====================================================
+// 8. STORAGE
+// =====================================================
+
+void saveLastRunDate(uint8_t index, uint32_t value) {
+  char key[8];
+
+  snprintf(key, sizeof(key), "run%u", index);
+
+  lastRunDate[index] = value;
+
+  preferences.putUInt(key, value);
+}
+
+void loadConfig() {
+  const uint8_t defaultHours[SCHEDULE_COUNT] = { 8, 12, 18, 22 };
+
+  for (uint8_t i = 0; i < SCHEDULE_COUNT; i++) {
+    schedules[i] = ScheduleConfig();
+    schedules[i].hour = defaultHours[i];
+  }
+
+  String saved = preferences.getString("cfg", "");
+
+  if (saved.length() > 0) {
+    ScheduleConfig candidate[SCHEDULE_COUNT];
+
+    if (parseConfig(saved, candidate)) {
+      for (uint8_t i = 0; i < SCHEDULE_COUNT; i++) {
+        schedules[i] = candidate[i];
+      }
+
+      Serial.println("[CFG] Loaded from flash");
+    } else {
+      Serial.println("[CFG] Saved config invalid -> defaults");
+    }
+  } else {
+    Serial.println("[CFG] No saved config -> defaults");
+  }
+
+  for (uint8_t i = 0; i < SCHEDULE_COUNT; i++) {
+    char key[8];
+
+    snprintf(key, sizeof(key), "run%u", i);
+
+    lastRunDate[i] = preferences.getUInt(key, 0);
+  }
+
+  Serial.print("[CFG]");
+  Serial.println(configSummary());
+}
+
+void applyConfig(const ScheduleConfig* candidate) {
+  for (uint8_t i = 0; i < SCHEDULE_COUNT; i++) {
+    bool changed =
+      candidate[i].hour != schedules[i].hour ||
+      candidate[i].minute != schedules[i].minute ||
+      candidate[i].dayMask != schedules[i].dayMask ||
+      candidate[i].enabled != schedules[i].enabled;
+
+    schedules[i] = candidate[i];
+
+    // เปลี่ยนเวลา/วัน/เปิด-ปิด -> ล้างสถานะ "รันไปแล้ววันนี้"
+    if (changed) {
+      saveLastRunDate(i, 0);
+    }
+  }
+
+  preferences.putString("cfg", serializeConfig());
+}
+
+// รับ config จาก Blynk (V5 หรือ V40)
+bool handleConfigPayload(
+  String payload,
+  const char* source,
+  bool echoToCloud
+) {
+  Serial.print("[CFG] Received via ");
+  Serial.print(source);
+  Serial.print(": ");
+  Serial.println(payload);
+
+  ScheduleConfig candidate[SCHEDULE_COUNT];
+
+  if (!parseConfig(payload, candidate)) {
+    setStatus(String("Config REJECTED (") + source + ")");
+    return false;
+  }
+
+  applyConfig(candidate);
+
+  if (echoToCloud && Blynk.connected()) {
+    Blynk.virtualWrite(V5, serializeConfig());
+  }
+
+  setStatus(String("Config OK (") + source + ")" + configSummary());
+
+  return true;
+}
+
+// =====================================================
+// 9. WIFI SETUP PORTAL
+// =====================================================
+
+const char PORTAL_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 WiFi Setup</title>
+<style>
+body {
+  font-family: Arial;
+  max-width: 420px;
+  margin: 35px auto;
+  padding: 15px;
+  background: #f4f6f8;
+}
+input, button {
+  width: 100%;
+  padding: 12px;
+  margin: 8px 0;
+  box-sizing: border-box;
+}
+button {
+  background: #1677d2;
+  color: white;
+  border: 0;
+}
+</style>
+</head>
+<body>
+<h2>ESP32 WiFi Setup</h2>
+<form action="/save" method="POST">
+<label>WiFi Name (SSID)</label>
+<input name="ssid" required>
+<label>WiFi Password</label>
+<input name="password" type="password">
+<button type="submit">Save WiFi</button>
+</form>
+</body>
+</html>
+)rawliteral";
+
+void setupPortalRoutes() {
+  portalServer.on("/", HTTP_GET, []() {
+    portalServer.send_P(200, "text/html", PORTAL_HTML);
+  });
+
+  portalServer.on("/save", HTTP_POST, []() {
+    String newSSID = portalServer.arg("ssid");
+    String newPassword = portalServer.arg("password");
+
+    newSSID.trim();
+
+    if (newSSID.length() == 0) {
+      portalServer.send(400, "text/plain", "SSID is required");
+      return;
+    }
+
+    preferences.putString("wifi", newSSID);
+    preferences.putString("pass", newPassword);
+
+    wifiSSID = newSSID;
+    wifiPassword = newPassword;
+
+    portalServer.send(
+      200,
+      "text/html",
+      "<h2>WiFi saved.</h2><p>ESP32 is connecting.</p>"
+    );
+
+    WiFi.disconnect(false, false);
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+
+    lastWiFiRetry = millis();
+  });
+
+  portalServer.onNotFound([]() {
+    portalServer.sendHeader("Location", "/", true);
+    portalServer.send(302, "text/plain", "");
+  });
+}
+
+void startPortal() {
+  if (portalActive) return;
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  portalServer.begin();
+
+  portalActive = true;
+
+  Serial.println("[WiFi] Setup portal started");
+  Serial.print("[WiFi] SSID: ");
+  Serial.println(AP_SSID);
+  Serial.print("[WiFi] IP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void stopPortal() {
+  if (!portalActive) return;
+
+  // ถ้ามีคนต่ออยู่ รอให้หน้า "WiFi saved" ส่งถึงมือถือก่อน
+  if (WiFi.softAPgetStationNum() > 0) {
+    delay(1500);
+  }
+
+  dnsServer.stop();
+  portalServer.stop();
+
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+
+  portalActive = false;
+
+  Serial.println("[WiFi] Setup portal stopped");
+}
+
+void handlePortal() {
+  if (!portalActive) return;
+
+  dnsServer.processNextRequest();
+  portalServer.handleClient();
+}
+
+// =====================================================
+// 10. OTA (ไม่มีรหัสผ่าน)
+// =====================================================
+
+void setupOTA() {
+  if (otaStarted || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+
+  ArduinoOTA.onStart([]() {
+    // ปิดปั๊มและหยุดงานทั้งหมดทันทีที่เริ่มอัปเดต
+    otaInProgress = true;
+
+    allPumpsOff();
+    machineState = MACHINE_IDLE;
+    pendingMask = 0;
+
+    systemStatus = "OTA update started";
+
+    Serial.println("[OTA] Update started - pumps OFF");
+  });
+
+  ArduinoOTA.onEnd([]() {
+    Serial.println("[OTA] Update completed, restarting...");
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    if (total == 0) return;
+
+    static unsigned long lastPrint = 0;
+
+    if (millis() - lastPrint >= 500) {
+      lastPrint = millis();
+
+      Serial.printf("[OTA] Progress: %u%%\n", (progress * 100U) / total);
+    }
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    otaInProgress = false;
+
+    Serial.printf("[OTA] Error: %u\n", (unsigned int)error);
+
+    systemStatus = "OTA failed";
+  });
+
+  ArduinoOTA.begin();
+
+  otaStarted = true;
+
+  Serial.print("[OTA] Ready, host ");
+  Serial.print(OTA_HOSTNAME);
+  Serial.print(", IP ");
+  Serial.println(WiFi.localIP());
+}
+
+// =====================================================
+// 11. WIFI + NTP
+// =====================================================
+
+void startNtp() {
+  configTime(
+    GMT_OFFSET_SEC,
+    DAYLIGHT_OFFSET_SEC,
+    "pool.ntp.org",
+    "time.google.com",
+    "time.nist.gov"
+  );
+
+  Serial.println("[NTP] Synchronization started");
+}
+
+void setupWiFi() {
+  wifiSSID = preferences.getString("wifi", "");
+  wifiPassword = preferences.getString("pass", "");
+
+  setupPortalRoutes();
+
+  if (wifiSSID.length() == 0) {
+    startPortal();
+    return;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+
+  Serial.print("[WiFi] Connecting");
+
+  unsigned long startAttempt = millis();
+
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    millis() - startAttempt < 15000
+  ) {
+    Serial.print(".");
+    delay(250);
+  }
+
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Connection failed -> setup portal");
+    startPortal();
+  } else {
+    Serial.print("[WiFi] Connected, IP ");
+    Serial.println(WiFi.localIP());
+  }
+}
+
+void maintainNetwork() {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiLostSince = 0;
+
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      lastNtpRetry = millis();
+      startNtp();
+    }
+
+    // ยังไม่ได้เวลา -> ลองขอใหม่ทุก 30 วินาที
+    if (!isTimeReady() && millis() - lastNtpRetry >= 30000) {
+      lastNtpRetry = millis();
+      startNtp();
+    }
+
+    if (portalActive) {
+      stopPortal();
+    }
+
+    if (!otaStarted) {
+      setupOTA();
+    }
+
+    return;
+  }
+
+  // ---- ยังไม่เชื่อมต่อ ----
+  wifiWasConnected = false;
+
+  if (otaStarted) {
+    ArduinoOTA.end();
+    otaStarted = false;
+  }
+
+  if (wifiLostSince == 0) {
+    wifiLostSince = millis();
+  }
+
+  // ไม่เคยตั้ง WiFi -> เปิด AP ทันที / เคยตั้งแต่ต่อไม่ได้ -> เปิดหลัง 20 วินาที
+  if (
+    !portalActive &&
+    (
+      wifiSSID.length() == 0 ||
+      millis() - wifiLostSince >= WIFI_PORTAL_DELAY_MS
+    )
+  ) {
+    Serial.println("[WiFi] Not connected -> starting setup portal");
+    startPortal();
+  }
+
+  // ลองต่อ WiFi เดิมเรื่อยๆ แม้ AP เปิดอยู่ (เว้นไว้ตอนมีคนต่อ AP เพื่อตั้งค่า)
+  bool someoneConfiguring =
+    portalActive && WiFi.softAPgetStationNum() > 0;
+
+  if (
+    wifiSSID.length() > 0 &&
+    !someoneConfiguring &&
+    millis() - lastWiFiRetry >= 15000
+  ) {
+    lastWiFiRetry = millis();
+
+    Serial.println("[WiFi] Retrying connection...");
+
+    WiFi.disconnect(false, false);
+    WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+  }
+}
+
+// =====================================================
+// 12. BLYNK CONNECTION
+// =====================================================
+
+void maintainBlynk() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  if (Blynk.connected()) {
+    Blynk.run();
+    return;
+  }
+
+  // ไม่พยายามเชื่อมใหม่ขณะปั๊มกำลังทำงาน (การเชื่อมต่อบล็อกได้ถึง 0.5 วินาที)
+  if (machineState != MACHINE_IDLE) {
+    return;
+  }
+
+  if (millis() - lastBlynkRetry >= 10000) {
+    lastBlynkRetry = millis();
+
+    Serial.println("[Blynk] Connecting...");
+    Blynk.connect(500);
+  }
+}
+
+// ถ้า Cloud ไม่มีค่า config ให้ส่งค่าในเครื่องขึ้นไป
+void synchronizeLocalConfigIfNeeded() {
+  if (
+    Blynk.connected() &&
+    !cloudConfigReceived &&
+    millis() - cloudSyncStarted >= 5000
+  ) {
+    Serial.println("[Blynk] No cloud config -> uploading local config");
+
+    Blynk.virtualWrite(V5, serializeConfig());
+
+    cloudConfigReceived = true;
+  }
+}
+
+// =====================================================
+// 13. SEQUENCER
+// =====================================================
+
+void startCurrentPulse() {
+  ScheduleConfig& s = schedules[activeSchedule];
+
+  uint32_t durationMs =
+    (uint32_t)((currentPump == 0) ? s.tenths26 : s.tenths27) * 100UL;
+
+  setPump(currentPump, true);
+
+  machineState = MACHINE_PUMP_ON;
+  machineDeadline = millis() + durationMs;
+
+  Serial.print("[PUMP] GPIO");
+  Serial.print(currentPump == 0 ? PUMP1_PIN : PUMP2_PIN);
+  Serial.print(" ON for ");
+  Serial.print(durationMs / 1000.0, 1);
+  Serial.println(" seconds");
+}
+
+void scheduleNextPulse() {
+  ScheduleConfig& s = schedules[activeSchedule];
+
+  if (s.gapSeconds == 0) {
+    startCurrentPulse();
+    return;
+  }
+
+  allPumpsOff();
+
+  machineState = MACHINE_GAP;
+  machineDeadline = millis() + (uint32_t)s.gapSeconds * 1000UL;
+}
+
+bool startSequence(uint8_t scheduleIndex, bool manual) {
+  if (scheduleIndex >= SCHEDULE_COUNT) {
+    return false;
+  }
+
+  if (machineState != MACHINE_IDLE || otaInProgress) {
+    setStatus("Cannot start: system busy");
+    return false;
+  }
+
+  ScheduleConfig& s = schedules[scheduleIndex];
+
+  if (!manual && !s.enabled) {
+    return false;
+  }
+
+  activeSchedule = scheduleIndex;
+
+  firstPump = s.reverseOrder ? 1 : 0;
+  currentPump = firstPump;
+
+  repetitionCount = 0;
+
+  allPumpsOff();
+
+  setStatus(
+    String(manual ? "Manual test started: Schedule "
+                  : "Automatic schedule started: Schedule ") +
+    String(scheduleIndex + 1)
+  );
+
+  startCurrentPulse();
+
+  return true;
+}
+
+void stopAll() {
+  allPumpsOff();
+
+  machineState = MACHINE_IDLE;
+  pendingMask = 0;
+  repetitionCount = 0;
+
+  setStatus("STOP activated - all pumps OFF");
+}
+
+void finishSequence() {
+  allPumpsOff();
+
+  machineState = MACHINE_IDLE;
+
+  setStatus(String("Schedule ") + String(activeSchedule + 1) + " completed");
+}
+
+void processSequencer() {
+  if (machineState == MACHINE_IDLE) {
+    return;
+  }
+
+  if ((int32_t)(millis() - machineDeadline) < 0) {
+    return;
+  }
+
+  if (machineState == MACHINE_GAP) {
+    startCurrentPulse();
+    return;
+  }
+
+  // MACHINE_PUMP_ON หมดเวลา
+  allPumpsOff();
+
+  repetitionCount++;
+
+  ScheduleConfig& s = schedules[activeSchedule];
+
+  uint16_t targetRepetitions =
+    (currentPump == 0) ? s.repetitions26 : s.repetitions27;
+
+  if (repetitionCount >= targetRepetitions) {
+    if (currentPump == firstPump) {
+      currentPump = 1 - firstPump;
+      repetitionCount = 0;
+    } else {
+      finishSequence();
+      return;
+    }
+  }
+
+  scheduleNextPulse();
+}
+
+// =====================================================
+// 14. AUTOMATIC SCHEDULER
+// =====================================================
+
+uint32_t makeDateValue(const tm& t) {
+  return
+    (uint32_t)(t.tm_year + 1900) * 10000UL +
+    (uint32_t)(t.tm_mon + 1) * 100UL +
+    (uint32_t)t.tm_mday;
+}
+
+void checkSchedules() {
+  static unsigned long lastCheckMs = 0;
+
+  if (millis() - lastCheckMs < 1000) {
+    return;
+  }
+
+  lastCheckMs = millis();
+
+  if (!isTimeReady()) {
+    return;
+  }
+
+  time_t now = time(nullptr);
+
+  tm t;
+  localtime_r(&now, &t);
+
+  uint32_t today = makeDateValue(t);
+
+  uint32_t nowSec =
+    (uint32_t)t.tm_hour * 3600UL +
+    (uint32_t)t.tm_min * 60UL +
+    (uint32_t)t.tm_sec;
+
+  // Monday = bit 0 ... Sunday = bit 6
+  uint8_t dayBit = (t.tm_wday == 0) ? 6 : (t.tm_wday - 1);
+
+  for (uint8_t i = 0; i < SCHEDULE_COUNT; i++) {
+    ScheduleConfig& s = schedules[i];
+
+    if (!s.enabled) continue;
+    if (lastRunDate[i] == today) continue;
+    if ((s.dayMask & (1U << dayBit)) == 0) continue;
+
+    uint32_t scheduledSec =
+      (uint32_t)s.hour * 3600UL + (uint32_t)s.minute * 60UL;
+
+    if (
+      nowSec >= scheduledSec &&
+      nowSec < scheduledSec + RUN_WINDOW_SEC
+    ) {
+      saveLastRunDate(i, today);
+
+      pendingMask |= (1U << i);
+
+      setStatus(String("Schedule ") + String(i + 1) + " queued");
+    }
+  }
+}
+
+void startNextPendingSchedule() {
+  if (machineState != MACHINE_IDLE || otaInProgress) {
+    return;
+  }
+
+  for (uint8_t i = 0; i < SCHEDULE_COUNT; i++) {
+    uint8_t bit = (1U << i);
+
+    if (pendingMask & bit) {
+      pendingMask &= ~bit;
+
+      if (!schedules[i].enabled) {
+        continue;
+      }
+
+      startSequence(i, false);
+      return;
+    }
+  }
+}
+
+// =====================================================
+// 15. MANUAL TEST
+// =====================================================
+
+void startManualTest(int scheduleNumber) {
+  if (scheduleNumber < 1 || scheduleNumber > SCHEDULE_COUNT) {
+    setStatus("Invalid manual schedule");
+    return;
+  }
+
+  if (machineState != MACHINE_IDLE || pendingMask != 0 || otaInProgress) {
+    setStatus("Manual test rejected: system busy");
+    return;
+  }
+
+  startSequence(scheduleNumber - 1, true);
+}
+
+// =====================================================
+// 16. BLYNK CALLBACKS
+// =====================================================
+
+BLYNK_CONNECTED() {
+  Serial.println("[Blynk] Connected");
+
+  cloudConfigReceived = false;
+  cloudSyncStarted = millis();
+
+  Blynk.syncVirtual(V5);
+
+  setStatus("Blynk connected - syncing config");
+}
+
+// V5: เก็บ/ซิงค์ config
+BLYNK_WRITE(V5) {
+  const char* received = param.asStr();
+
+  String incoming = received ? String(received) : "";
+
+  incoming.trim();
+
+  cloudConfigReceived = true;
+
+  if (incoming.length() == 0) {
+    Blynk.virtualWrite(V5, serializeConfig());
+
+    Serial.println("[Blynk] Local config uploaded");
+    return;
+  }
+
+  handleConfigPayload(incoming, "V5", false);
+}
+
+// V40: คำสั่ง STOP / TEST:n / CFG:<config>
+BLYNK_WRITE(V40) {
+  const char* received = param.asStr();
+
+  String command = received ? String(received) : "";
+
+  command.trim();
+
+  Serial.print("[Blynk] Command: ");
+  Serial.println(command);
+
+  if (command == "STOP") {
+    stopAll();
+    return;
+  }
+
+  if (command.startsWith("TEST:")) {
+    startManualTest(command.substring(5).toInt());
+    return;
+  }
+
+  if (command.startsWith("CFG:")) {
+    handleConfigPayload(command.substring(4), "V40", true);
+    return;
+  }
+
+  if (command.length() > 0) {
+    setStatus("Unknown command");
+  }
+}
+
+// V41 เป็น output อย่างเดียว
+
+// =====================================================
+// 17. SETUP / LOOP
+// =====================================================
+
+void setup() {
+  Serial.begin(115200);
+
+  // ตั้งระดับ OFF ก่อนเปิดเอาต์พุต
+  digitalWrite(PUMP1_PIN, RELAY_OFF);
+  digitalWrite(PUMP2_PIN, RELAY_OFF);
+
+  pinMode(PUMP1_PIN, OUTPUT);
+  pinMode(PUMP2_PIN, OUTPUT);
+
+  allPumpsOff();
+
+  preferences.begin("feedcfg", false);
+
+  loadConfig();
+
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  blynkTimer.setInterval(5000L, publishStatus);
+
+  setupWiFi();
+
+  Serial.println();
+  Serial.println("=================================");
+  Serial.println("ESP32 Feeding Scheduler");
+  Serial.println("GPIO26 = Pump 1, GPIO27 = Pump 2");
+  Serial.println("4 schedules, min pump time 0.1 s");
+  Serial.println("ArduinoOTA enabled (no password)");
+  Serial.println("=================================");
+
+  setStatus("System ready - pumps OFF");
+}
+
+void loop() {
+  // ระหว่าง OTA ไม่ทำงานอื่น
+  if (otaInProgress) {
+    ArduinoOTA.handle();
+    return;
+  }
+
+  handlePortal();
+
+  maintainNetwork();
+
+  maintainBlynk();
+
+  blynkTimer.run();
+
+  synchronizeLocalConfigIfNeeded();
+
+  processSequencer();
+
+  checkSchedules();
+
+  startNextPendingSchedule();
+
+  if (otaStarted && WiFi.status() == WL_CONNECTED) {
+    ArduinoOTA.handle();
+  }
+}
