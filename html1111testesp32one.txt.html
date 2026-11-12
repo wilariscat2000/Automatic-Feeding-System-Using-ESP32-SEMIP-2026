@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>ESP32 Feeding System</title>
+
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #10151d;
+  --card: #1b2430;
+  --field: #111923;
+  --border: #344153;
+  --text: #f3f6fa;
+  --muted: #a7b3c2;
+  --blue: #3988f5;
+  --green: #20b77a;
+  --red: #e05252;
+}
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 14px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Arial, sans-serif;
+  font-size: 14px;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 14px;
+  gap: 8px;
+}
+
+h1 { font-size: 19px; margin: 0; }
+h2 { font-size: 16px; margin: 0; }
+
+.muted { color: var(--muted); font-size: 12px; }
+
+.status {
+  display: inline-block;
+  padding: 7px 10px;
+  border-radius: 20px;
+  background: #293544;
+  font-size: 12px;
+  max-width: 55%;
+  overflow-wrap: anywhere;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  padding: 13px;
+  margin-bottom: 12px;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.enable {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+label {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+input, select {
+  width: 100%;
+  min-width: 0;
+  margin-top: 5px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--field);
+  color: var(--text);
+  font-size: 14px;
+}
+
+input[type="checkbox"] {
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  accent-color: var(--blue);
+}
+
+input[type="time"] { min-height: 40px; }
+
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 11px;
+}
+
+.days {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  margin-top: 8px;
+  margin-bottom: 12px;
+}
+
+.day {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+button {
+  border: 0;
+  border-radius: 9px;
+  padding: 12px;
+  color: white;
+  font-size: 14px;
+  font-weight: bold;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+
+.primary { background: var(--blue); width: 100%; }
+.green { background: var(--green); flex: 1; }
+.red { background: var(--red); flex: 1; }
+.secondary { background: #39485b; }
+
+.actions {
+  display: flex;
+  gap: 9px;
+  margin-top: 10px;
+}
+
+.section-title {
+  margin: 17px 0 9px;
+  font-weight: bold;
+}
+
+.footer {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: center;
+  margin-top: 14px;
+}
+
+#message {
+  margin-top: 10px;
+  min-height: 18px;
+  color: #8fc3ff;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+</style>
+</head>
+
+<body>
+
+<header>
+  <div>
+    <h1>Feeding System</h1>
+    <div class="muted">ESP32 Schedule Controller</div>
+  </div>
+  <div class="status" id="systemStatus">Connecting...</div>
+</header>
+
+<div id="scheduleCards"></div>
+
+<div class="card">
+  <h2>Manual Control</h2>
+
+  <label style="margin-top:12px;">
+    Select Schedule
+    <select id="manualSchedule">
+      <option value="1">Schedule 1</option>
+      <option value="2">Schedule 2</option>
+      <option value="3">Schedule 3</option>
+      <option value="4">Schedule 4</option>
+    </select>
+  </label>
+
+  <div class="actions">
+    <button class="green" id="testButton">TEST</button>
+    <button class="red" id="stopButton">EMERGENCY STOP</button>
+  </div>
+</div>
+
+<button class="primary" id="saveButton">SAVE ALL SCHEDULES</button>
+
+<div id="message"></div>
+
+<div class="footer">
+  Prototype control interface. Water-only testing. Not for use with patients.
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const dayNames = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+  // เวลาเปิดปั๊ม: 0.1 - 300 วินาที (ทศนิยมได้ 1 ตำแหน่ง)
+  const MIN_SEC = 0.1;
+  const MAX_SEC = 300;
+
+  function isTenths(n) {
+    return Number.isFinite(n) &&
+           Math.abs(n * 10 - Math.round(n * 10)) < 1e-6;
+  }
+
+  function validSec(n) {
+    return isTenths(n) && n >= MIN_SEC - 1e-9 && n <= MAX_SEC + 1e-9;
+  }
+
+  // 10 -> "10", 2.5 -> "2.5", 0.1 -> "0.1"
+  function fmtSec(n) {
+    return String(Math.round(n * 10) / 10);
+  }
+
+  function makeDefaultSchedule(hour) {
+    return {
+      time: hour + ":00",
+      days: 127,
+      enabled: false,
+      order: 0,
+      sec26: 10,
+      rep26: 2,
+      sec27: 10,
+      rep27: 2,
+      gap: 30
+    };
+  }
+
+  let schedules = [
+    makeDefaultSchedule("08"),
+    makeDefaultSchedule("12"),
+    makeDefaultSchedule("18"),
+    makeDefaultSchedule("22")
+  ];
+
+  let bridge = null;
+  let configLoaded = false;
+
+  const cardsElement = document.getElementById("scheduleCards");
+  const statusElement = document.getElementById("systemStatus");
+  const messageElement = document.getElementById("message");
+
+  function showMessage(message) {
+    messageElement.textContent = message;
+  }
+
+  function setSystemStatus(message) {
+    statusElement.textContent = message || "No status";
+  }
+
+  function renderCards() {
+    cardsElement.innerHTML = schedules.map(function (s, i) {
+      const dayCheckboxes = dayNames.map(function (day, d) {
+        const checked = (s.days & (1 << d)) !== 0;
+
+        return `
+          <label class="day">
+            <input type="checkbox" data-day="${d}" ${checked ? "checked" : ""}>
+            ${day}
+          </label>
+        `;
+      }).join("");
+
+      return `
+        <section class="card schedule-card" data-index="${i}">
+          <div class="card-head">
+            <h2>Schedule ${i + 1}</h2>
+            <label class="enable">
+              <input class="enabled" type="checkbox" ${s.enabled ? "checked" : ""}>
+              Enabled
+            </label>
+          </div>
+
+          <div class="grid2">
+            <label>
+              Feeding Time
+              <input class="time" type="time" value="${s.time}">
+            </label>
+
+            <label>
+              Pump Order
+              <select class="order">
+                <option value="0" ${s.order === 0 ? "selected" : ""}>GPIO26 first</option>
+                <option value="1" ${s.order === 1 ? "selected" : ""}>GPIO27 first</option>
+              </select>
+            </label>
+          </div>
+
+          <label>Days of Week</label>
+          <div class="days">${dayCheckboxes}</div>
+
+          <div class="section-title">GPIO26 / Pump 1</div>
+          <div class="grid2">
+            <label>
+              Running Time (sec)
+              <input class="sec26" type="number" inputmode="decimal" min="0.1" max="300" step="0.1" value="${fmtSec(s.sec26)}">
+            </label>
+            <label>
+              Repetitions
+              <input class="rep26" type="number" min="1" max="20" value="${s.rep26}">
+            </label>
+          </div>
+
+          <div class="section-title">GPIO27 / Pump 2</div>
+          <div class="grid2">
+            <label>
+              Running Time (sec)
+              <input class="sec27" type="number" inputmode="decimal" min="0.1" max="300" step="0.1" value="${fmtSec(s.sec27)}">
+            </label>
+            <label>
+              Repetitions
+              <input class="rep27" type="number" min="1" max="20" value="${s.rep27}">
+            </label>
+          </div>
+
+          <label>
+            Gap Between Pump Operations (seconds)
+            <input class="gap" type="number" min="0" max="3600" value="${s.gap}">
+          </label>
+        </section>
+      `;
+    }).join("");
+  }
+
+  function parseConfig(payload) {
+    const rows = payload.split("|");
+
+    if (rows.length !== 4) {
+      throw new Error("Invalid configuration: expected 4 schedules");
+    }
+
+    const result = rows.map(function (row) {
+      const f = row.split(",");
+
+      if (f.length !== 9) {
+        throw new Error("Invalid schedule field count");
+      }
+
+      if (!/^\d{2}:\d{2}$/.test(f[0])) {
+        throw new Error("Invalid time format");
+      }
+
+      const hour = Number(f[0].slice(0, 2));
+      const minute = Number(f[0].slice(3, 5));
+
+      const nums = f.slice(1).map(Number);
+
+      // ลำดับ nums: days, enabled, order, sec26, rep26, sec27, rep27, gap
+      // sec26 (index 3) และ sec27 (index 5) เป็นทศนิยมได้
+      const decimalIdx = [3, 5];
+
+      if (
+        hour > 23 || minute > 59 ||
+        nums.some(function (n, idx) {
+          if (decimalIdx.indexOf(idx) >= 0) {
+            return !isTenths(n);
+          }
+          return !Number.isInteger(n);
+        })
+      ) {
+        throw new Error("Invalid schedule number");
+      }
+
+      const [days, enabled, order, sec26, rep26, sec27, rep27, gap] = nums;
+
+      if (
+        days < 0 || days > 127 ||
+        (enabled !== 0 && enabled !== 1) ||
+        (order !== 0 && order !== 1) ||
+        !validSec(sec26) ||
+        rep26 < 1 || rep26 > 20 ||
+        !validSec(sec27) ||
+        rep27 < 1 || rep27 > 20 ||
+        gap < 0 || gap > 3600
+      ) {
+        throw new Error("Schedule values out of range");
+      }
+
+      return {
+        time: f[0],
+        days: days,
+        enabled: enabled === 1,
+        order: order,
+        sec26: sec26,
+        rep26: rep26,
+        sec27: sec27,
+        rep27: rep27,
+        gap: gap
+      };
+    });
+
+    schedules = result;
+    configLoaded = true;
+    renderCards();
+  }
+
+  function readCards() {
+    const cards = document.querySelectorAll(".schedule-card");
+    const result = [];
+
+    cards.forEach(function (card) {
+      const time = card.querySelector(".time").value;
+      const enabled = card.querySelector(".enabled").checked;
+      const order = Number(card.querySelector(".order").value);
+
+      let days = 0;
+
+      card.querySelectorAll("[data-day]").forEach(function (checkbox) {
+        if (checkbox.checked) {
+          days |= (1 << Number(checkbox.dataset.day));
+        }
+      });
+
+      const sec26 = Number(card.querySelector(".sec26").value);
+      const rep26 = Number(card.querySelector(".rep26").value);
+      const sec27 = Number(card.querySelector(".sec27").value);
+      const rep27 = Number(card.querySelector(".rep27").value);
+      const gap = Number(card.querySelector(".gap").value);
+
+      if (!time) {
+        throw new Error("Please select a feeding time");
+      }
+
+      if (enabled && days === 0) {
+        throw new Error("An enabled schedule must have at least one day selected");
+      }
+
+      if (
+        !validSec(sec26) ||
+        !Number.isInteger(rep26) || rep26 < 1 || rep26 > 20 ||
+        !validSec(sec27) ||
+        !Number.isInteger(rep27) || rep27 < 1 || rep27 > 20 ||
+        !Number.isInteger(gap) || gap < 0 || gap > 3600
+      ) {
+        throw new Error("Check pump values (running time 0.1-300 sec, 1 decimal place)");
+      }
+
+      result.push({
+        time: time,
+        days: days,
+        enabled: enabled,
+        order: order,
+        sec26: Math.round(sec26 * 10) / 10,
+        rep26: rep26,
+        sec27: Math.round(sec27 * 10) / 10,
+        rep27: rep27,
+        gap: gap
+      });
+    });
+
+    return result;
+  }
+
+  function serializeConfig(data) {
+    return data.map(function (s) {
+      return [
+        s.time,
+        s.days,
+        s.enabled ? 1 : 0,
+        s.order,
+        fmtSec(s.sec26),
+        s.rep26,
+        fmtSec(s.sec27),
+        s.rep27,
+        s.gap
+      ].join(",");
+    }).join("|");
+  }
+
+  document.getElementById("saveButton").addEventListener("click", function () {
+    if (!bridge) {
+      showMessage("Open this interface inside the Blynk HTML Widget.");
+      return;
+    }
+
+    try {
+      const data = readCards();
+      const payload = serializeConfig(data);
+
+      bridge.sendValue(0, payload);            // ช่องเดิม (V5)
+      bridge.sendValue(1, "CFG:" + payload);   // ช่องเดียวกับ TEST (V40)
+
+      schedules = data;
+      showMessage("Configuration sent. Check the status badge for 'Config OK'.");
+    } catch (error) {
+      showMessage(error.message);
+    }
+  });
+
+  document.getElementById("testButton").addEventListener("click", function () {
+    if (!bridge) {
+      showMessage("Blynk connection is not available.");
+      return;
+    }
+
+    const selected = document.getElementById("manualSchedule").value;
+
+    bridge.sendValue(1, "TEST:" + selected);
+    showMessage("Manual test command sent for Schedule " + selected + ".");
+  });
+
+  document.getElementById("stopButton").addEventListener("click", function () {
+    if (!bridge) {
+      showMessage("Blynk connection is not available.");
+      return;
+    }
+
+    if (!window.confirm("Send Emergency STOP to the ESP32?")) {
+      return;
+    }
+
+    bridge.sendValue(1, "STOP");
+    showMessage("Emergency STOP command sent.");
+  });
+
+  function applyValue(index, value) {
+    if (index === 0 && value) {
+      try {
+        parseConfig(value);
+        showMessage("Schedule configuration received.");
+      } catch (error) {
+        showMessage(error.message);
+      }
+    }
+
+    if (index === 2) {
+      setSystemStatus(value);
+    }
+  }
+
+  function initialize() {
+    renderCards();
+
+    if (typeof BlynkBridge === "undefined") {
+      setSystemStatus("Preview only");
+      showMessage("This preview is not connected to the ESP32.");
+      return;
+    }
+
+    bridge = new BlynkBridge({
+      logEnabled: true,
+      isOnErrorEnabled: true
+    });
+
+    bridge.setCallbacks({
+      onValueUpdated: function (data) {
+        applyValue(data.index, data.value);
+      },
+
+      onError: function (message) {
+        showMessage("Blynk error: " + message);
+      }
+    });
+
+    bridge.getValues().then(function (values) {
+      if (!values || values.length < 3) {
+        showMessage("Assign all 3 Datastreams to this HTML Widget.");
+        return;
+      }
+
+      values.forEach(function (item) {
+        applyValue(item.index, item.value);
+      });
+
+      if (!configLoaded) {
+        showMessage("No saved schedule configuration yet. Set values and save.");
+      }
+    }).catch(function () {
+      showMessage("Unable to read Datastreams. Check Widget bindings.");
+    });
+  }
+
+  initialize();
+})();
+</script>
+
+</body>
+</html>
